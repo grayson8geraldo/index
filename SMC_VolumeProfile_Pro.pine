@@ -1,4 +1,4 @@
-//@version=5
+//@version=6
 // =============================================================================
 // SMC + Volume Profile Pro  (Kelly structure + Faiz SMC / ICT)
 // -----------------------------------------------------------------------------
@@ -330,13 +330,10 @@ if longSig
 if shortSig
     cntShort += 1
 
+hudAnchor = hudPos == "top_right" ? position.top_right : hudPos == "top_left" ? position.top_left : hudPos == "bottom_right" ? position.bottom_right : position.bottom_left
+
 if showHUD and barstate.islast
-    var table hud = table.new(
-         hudPos == "top_right"    ? position.top_right    :
-         hudPos == "top_left"     ? position.top_left     :
-         hudPos == "bottom_right" ? position.bottom_right :
-                                    position.bottom_left,
-         2, 7, border_width=1)
+    var table hud = table.new(hudAnchor, 2, 7, border_width=1)
     trendTxt = trend == 1 ? "BULL" : trend == -1 ? "BEAR" : "NONE"
     trendCol = trend == 1 ? color.new(color.green, 70) :
                trend == -1 ? color.new(color.red, 70) : color.new(color.gray, 70)
