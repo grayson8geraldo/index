@@ -1,0 +1,375 @@
+//@version=5
+// =============================================================================
+// SMC + Volume Profile Pro  (Kelly structure + Faiz SMC / ICT)
+// -----------------------------------------------------------------------------
+// Composite indicator for scalping indices and FX:
+//   1. HTF/MTF bias via automated market structure (Swing, BOS, CHoCH)
+//   2. Overnight Value Area (VAH / VAL / POC) Fixed Range Volume Profile
+//   3. ICT Fair Value Gap detection on LTF
+//   4. Entries: Failed Auction (VA reclaim) and Breakout + LTF BOS
+//   5. Session killzones (London / NY) + auto RR targets + alerts + stats HUD
+// -----------------------------------------------------------------------------
+// Risk disclaimer: no indicator guarantees profit. Always size risk
+// per trade (<= 1% of equity) and aim for RR >= 1:2.
+// =============================================================================
+indicator("SMC + Volume Profile Pro [Kelly/Faiz]", shorttitle="SMC+VP Pro",
+     overlay=true, max_boxes_count=500, max_lines_count=500,
+     max_labels_count=500, max_bars_back=5000)
+
+// ============================== INPUTS ======================================
+gS = "1 · Market Structure (Kelly)"
+htfTF     = input.timeframe("240", "HTF (context)",                group=gS)
+mtfTF     = input.timeframe("15",  "MTF (bias / BOS / CHoCH)",     group=gS)
+ltfTF     = input.timeframe("1",   "LTF (entry / MSS)",            group=gS)
+swingLen  = input.int(5, "Swing length (fractal)", minval=2, maxval=20, group=gS)
+bodyBreak = input.bool(true, "BOS / CHoCH by BODY close (ignore wicks)", group=gS)
+showSwings= input.bool(true, "Mark swings on chart", group=gS)
+
+gV = "2 · Volume Profile (Faiz, overnight)"
+vpRows    = input.int(100, "Profile rows (granularity)", minval=20, maxval=500, group=gV)
+vaPct     = input.float(70.0, "Value Area %", minval=50, maxval=90, group=gV) / 100.0
+sessTZ    = input.string("America/New_York", "Session timezone",
+     options=["America/New_York","Europe/London","UTC","Asia/Tokyo"], group=gV)
+sessOver  = input.session("1800-0855:1234567", "Overnight window (open NY -> pre-market)", group=gV)
+extendVA  = input.bool(true, "Extend VA into the trading day", group=gV)
+showPOC   = input.bool(true, "Show POC line", group=gV)
+
+gF = "3 · ICT / FVG"
+showFVG     = input.bool(true,  "Show Fair Value Gaps", group=gF)
+fvgAtrMult  = input.float(0.15, "Min FVG size (× ATR14)", minval=0, step=0.05, group=gF)
+fvgLookback = input.int(60, "Keep last N FVGs", minval=5, maxval=500, group=gF)
+
+gE = "4 · Entries & Risk"
+useFA     = input.bool(true,  "Setup: Failed Auction (reclaim into VA)", group=gE)
+useBRK    = input.bool(true,  "Setup: Breakout + LTF BOS", group=gE)
+requireFVG= input.bool(true,  "Require FVG confluence inside VA for FA", group=gE)
+rrTarget  = input.float(2.0,  "Risk/Reward target (for TP)", minval=0.5, step=0.5, group=gE)
+slBuffer  = input.float(0.15, "SL buffer (× ATR14) beyond structure", minval=0, step=0.05, group=gE)
+
+gK = "5 · Killzones (NY time)"
+useKZ   = input.bool(true, "Only trade inside killzones", group=gK)
+kzLDN   = input.session("0200-0500:23456", "London KZ", group=gK)
+kzNY    = input.session("0830-1100:23456", "NY KZ",     group=gK)
+
+gA = "6 · Alerts & UI"
+alertLong   = input.bool(true, "Alert on LONG signals",  group=gA)
+alertShort  = input.bool(true, "Alert on SHORT signals", group=gA)
+showHUD     = input.bool(true, "Show stats dashboard",   group=gA)
+hudPos      = input.string("top_right", "HUD position",
+     options=["top_right","top_left","bottom_right","bottom_left"], group=gA)
+
+// ============================== HELPERS =====================================
+inSess(sess, tz) => not na(time(timeframe.period, sess, tz))
+inKZ() => not useKZ or inSess(kzLDN, "America/New_York") or inSess(kzNY, "America/New_York")
+
+atr14 = ta.atr(14)
+
+// ============================== MTF STRUCTURE ================================
+// Pivots & OHLC on MTF
+[mtfO, mtfH, mtfL, mtfC, mtfPH, mtfPL] = request.security(
+     syminfo.tickerid, mtfTF,
+     [open, high, low, close,
+      ta.pivothigh(high, swingLen, swingLen),
+      ta.pivotlow (low,  swingLen, swingLen)],
+     lookahead=barmerge.lookahead_off)
+
+// Track last confirmed swings + trend
+var float lastSH   = na
+var float lastSL   = na
+var int   trend    = 0      //  1 bullish, -1 bearish, 0 none
+var bool  lastBOS  = false
+var bool  lastCHOCH= false
+var int   swingHBar= na
+var int   swingLBar= na
+
+if not na(mtfPH)
+    lastSH    := mtfPH
+    swingHBar := bar_index - swingLen
+if not na(mtfPL)
+    lastSL    := mtfPL
+    swingLBar := bar_index - swingLen
+
+// Break reference (body vs wick)
+brkUp   = bodyBreak ? math.max(mtfO, mtfC) : mtfH
+brkDown = bodyBreak ? math.min(mtfO, mtfC) : mtfL
+
+newBOS   = false
+newCHOCH = false
+
+if not na(lastSH) and brkUp > lastSH and nz(brkUp[1]) <= lastSH
+    if trend == 1
+        newBOS := true
+    else
+        newCHOCH := true
+    trend := 1
+
+if not na(lastSL) and brkDown < lastSL and nz(brkDown[1]) >= lastSL
+    if trend == -1
+        newBOS := true
+    else
+        newCHOCH := true
+    trend := -1
+
+lastBOS   := newBOS
+lastCHOCH := newCHOCH
+
+// HTF context (confluence filter)
+[htfO, htfC] = request.security(syminfo.tickerid, htfTF, [open, close], lookahead=barmerge.lookahead_off)
+htfBias = htfC > htfO ? 1 : htfC < htfO ? -1 : 0
+
+// ============================== VOLUME PROFILE ==============================
+// Build profile bar-by-bar during overnight session, lock it when session ends
+var float sessHi   = na
+var float sessLo   = na
+var float[] bins   = array.new_float(vpRows, 0.0)
+var float  poc     = na
+var float  vah     = na
+var float  val     = na
+var bool   vaLocked= false
+var int    vaStart = na
+
+inOver = inSess(sessOver, sessTZ)
+justStart = inOver and not inOver[1]
+justEnd   = not inOver and inOver[1]
+
+if justStart
+    sessHi   := high
+    sessLo   := low
+    vaLocked := false
+    vaStart  := bar_index
+    array.fill(bins, 0.0)
+
+if inOver
+    sessHi := math.max(nz(sessHi, high), high)
+    sessLo := math.min(nz(sessLo, low),  low)
+    // Distribute this bar's volume across bins that the bar covers
+    if not na(sessHi) and not na(sessLo) and sessHi > sessLo
+        binSize = (sessHi - sessLo) / vpRows
+        if binSize > 0
+            loIdx = math.max(0,          math.floor((low  - sessLo) / binSize))
+            hiIdx = math.min(vpRows - 1, math.floor((high - sessLo) / binSize))
+            span  = math.max(1, hiIdx - loIdx + 1)
+            vPer  = volume / span
+            for i = loIdx to hiIdx
+                array.set(bins, i, array.get(bins, i) + vPer)
+
+// Lock VA when overnight session closes
+if justEnd and not vaLocked and not na(sessHi) and not na(sessLo) and sessHi > sessLo
+    binSize = (sessHi - sessLo) / vpRows
+    total   = array.sum(bins)
+    // POC = bin with max volume
+    pocIdx = 0
+    pocVol = 0.0
+    for i = 0 to vpRows - 1
+        v = array.get(bins, i)
+        if v > pocVol
+            pocVol := v
+            pocIdx := i
+    // Expand around POC until VA% reached
+    acc     = pocVol
+    hiIdx   = pocIdx
+    loIdx   = pocIdx
+    target  = total * vaPct
+    while acc < target and (hiIdx < vpRows - 1 or loIdx > 0)
+        upV = hiIdx < vpRows - 1 ? array.get(bins, hiIdx + 1) : -1.0
+        dnV = loIdx > 0          ? array.get(bins, loIdx - 1) : -1.0
+        if upV >= dnV and hiIdx < vpRows - 1
+            hiIdx += 1
+            acc   += upV
+        else if loIdx > 0
+            loIdx -= 1
+            acc   += dnV
+        else
+            break
+    poc := sessLo + (pocIdx + 0.5) * binSize
+    val := sessLo + loIdx          * binSize
+    vah := sessLo + (hiIdx + 1)    * binSize
+    vaLocked := true
+
+// Draw VA boxes / lines on the trading day (auto-extend through the session)
+var box  vaBox = na
+var line pocLn = na
+if vaLocked and justEnd
+    if not na(vaBox)
+        box.delete(vaBox)
+    if not na(pocLn)
+        line.delete(pocLn)
+    vaBox := box.new(vaStart, vah, bar_index, val,
+         border_color=color.new(color.gray, 40),
+         bgcolor=color.new(color.blue, 88),
+         extend=extendVA ? extend.right : extend.none)
+    if showPOC
+        pocLn := line.new(vaStart, poc, bar_index, poc,
+             color=color.new(color.yellow, 20), width=1, style=line.style_dashed,
+             extend=extendVA ? extend.right : extend.none)
+
+// ============================== FVG DETECTION ===============================
+// Bullish FVG: low[0] > high[2]
+// Bearish FVG: high[0] < low[2]
+var box[] fvgBoxes = array.new_box()
+minGap = atr14 * fvgAtrMult
+
+bullFVG = showFVG and low  > high[2] and (low  - high[2]) > minGap
+bearFVG = showFVG and high < low[2]  and (low[2] - high)  > minGap
+
+f_pushFVG(bool isBull, float top, float bot) =>
+    col = isBull ? color.new(color.teal, 80) : color.new(color.maroon, 80)
+    b   = box.new(bar_index - 2, top, bar_index + 10, bot,
+         border_color=color.new(color.gray, 60), bgcolor=col)
+    array.push(fvgBoxes, b)
+    if array.size(fvgBoxes) > fvgLookback
+        old = array.shift(fvgBoxes)
+        box.delete(old)
+
+if bullFVG
+    f_pushFVG(true,  low,     high[2])
+if bearFVG
+    f_pushFVG(false, low[2],  high)
+
+// Is current price inside any active FVG?  (confluence check)
+priceInFVG() =>
+    found = false
+    if array.size(fvgBoxes) > 0
+        for i = 0 to array.size(fvgBoxes) - 1
+            b = array.get(fvgBoxes, i)
+            if close <= box.get_top(b) and close >= box.get_bottom(b)
+                found := true
+    found
+
+// ============================== ENTRY LOGIC =================================
+// Positions relative to VA
+aboveVAH = vaLocked and close > vah
+belowVAL = vaLocked and close < val
+inVA     = vaLocked and close <= vah and close >= val
+
+// -------- Failed Auction (reclaim into VA) -------
+// Short setup: prior bars poked above VAH, this bar closes body back inside VA
+faShort = useFA and vaLocked and high[1] > vah and close < vah and close > val
+     and math.max(open, close) < vah  // body inside
+faLong  = useFA and vaLocked and low[1]  < val and close > val and close < vah
+     and math.min(open, close) > val
+
+if requireFVG
+    faShort := faShort and priceInFVG()
+    faLong  := faLong  and priceInFVG()
+
+// -------- Breakout + LTF BOS -------
+// LTF micro-structure shift from request.security
+[ltfPH, ltfPL] = request.security(syminfo.tickerid, ltfTF,
+     [ta.pivothigh(high, 2, 2), ta.pivotlow(low, 2, 2)], lookahead=barmerge.lookahead_off)
+
+var float ltfLastH = na
+var float ltfLastL = na
+if not na(ltfPH)
+    ltfLastH := ltfPH
+if not na(ltfPL)
+    ltfLastL := ltfPL
+
+ltfBosUp = not na(ltfLastH) and close > ltfLastH and close[1] <= nz(ltfLastH[1], ltfLastH)
+ltfBosDn = not na(ltfLastL) and close < ltfLastL and close[1] >= nz(ltfLastL[1], ltfLastL)
+
+brkLong  = useBRK and aboveVAH and ltfBosUp
+brkShort = useBRK and belowVAL and ltfBosDn
+
+// -------- Combine with bias & killzones -------
+biasLong  = trend == 1  and (htfBias >= 0)
+biasShort = trend == -1 and (htfBias <= 0)
+
+longSig  = inKZ() and biasLong  and (faLong  or brkLong)
+shortSig = inKZ() and biasShort and (faShort or brkShort)
+
+// -------- Auto SL / TP -------
+slLong  = (na(lastSL) ? low  : math.min(low,  lastSL)) - atr14 * slBuffer
+slShort = (na(lastSH) ? high : math.max(high, lastSH)) + atr14 * slBuffer
+tpLong  = close + (close - slLong)  * rrTarget
+tpShort = close - (slShort - close) * rrTarget
+
+// ============================== PLOTTING ====================================
+plot(vaLocked ? vah : na, "VAH", color=color.new(color.red,   30), style=plot.style_linebr, linewidth=2)
+plot(vaLocked ? val : na, "VAL", color=color.new(color.green, 30), style=plot.style_linebr, linewidth=2)
+
+plotshape(showSwings and not na(mtfPH), "Swing H", shape.triangledown,
+     location.abovebar, color.new(color.red, 40), size=size.tiny)
+plotshape(showSwings and not na(mtfPL), "Swing L", shape.triangleup,
+     location.belowbar, color.new(color.green, 40), size=size.tiny)
+
+if newBOS
+    label.new(bar_index, trend == 1 ? low : high, "BOS",
+         style=trend == 1 ? label.style_label_up : label.style_label_down,
+         color=color.new(color.blue, 30), textcolor=color.white, size=size.tiny)
+if newCHOCH
+    label.new(bar_index, trend == 1 ? low : high, "CHoCH",
+         style=trend == 1 ? label.style_label_up : label.style_label_down,
+         color=color.new(color.orange, 20), textcolor=color.white, size=size.tiny)
+
+plotshape(longSig,  "LONG",  shape.labelup,   location.belowbar,
+     color.new(color.lime, 0), textcolor=color.black, text="L", size=size.small)
+plotshape(shortSig, "SHORT", shape.labeldown, location.abovebar,
+     color.new(color.red,  0), textcolor=color.white, text="S", size=size.small)
+
+// Draw SL/TP markers for the latest signal
+var line slLine = na
+var line tpLine = na
+if longSig or shortSig
+    if not na(slLine)
+        line.delete(slLine)
+    if not na(tpLine)
+        line.delete(tpLine)
+    s = longSig ? slLong : slShort
+    t = longSig ? tpLong : tpShort
+    slLine := line.new(bar_index, s, bar_index + 20, s,
+         color=color.new(color.red, 20), style=line.style_dashed, width=1)
+    tpLine := line.new(bar_index, t, bar_index + 20, t,
+         color=color.new(color.green, 20), style=line.style_dashed, width=1)
+
+// ============================== STATS HUD ===================================
+var int cntLong  = 0
+var int cntShort = 0
+if longSig
+    cntLong  += 1
+if shortSig
+    cntShort += 1
+
+if showHUD and barstate.islast
+    var table hud = table.new(
+         hudPos == "top_right"    ? position.top_right    :
+         hudPos == "top_left"     ? position.top_left     :
+         hudPos == "bottom_right" ? position.bottom_right :
+                                    position.bottom_left,
+         2, 7, border_width=1)
+    trendTxt = trend == 1 ? "BULL" : trend == -1 ? "BEAR" : "NONE"
+    trendCol = trend == 1 ? color.new(color.green, 70) :
+               trend == -1 ? color.new(color.red, 70) : color.new(color.gray, 70)
+    kzTxt    = inKZ() ? "YES" : "NO"
+    table.cell(hud, 0, 0, "SMC + VP Pro",  bgcolor=color.new(color.black, 30), text_color=color.white)
+    table.cell(hud, 1, 0, str.tostring(syminfo.ticker), bgcolor=color.new(color.black, 30), text_color=color.white)
+    table.cell(hud, 0, 1, "Trend (MTF)",   text_color=color.white)
+    table.cell(hud, 1, 1, trendTxt,        bgcolor=trendCol, text_color=color.white)
+    table.cell(hud, 0, 2, "HTF bias",      text_color=color.white)
+    table.cell(hud, 1, 2, htfBias == 1 ? "BULL" : htfBias == -1 ? "BEAR" : "NEUT", text_color=color.white)
+    table.cell(hud, 0, 3, "In killzone",   text_color=color.white)
+    table.cell(hud, 1, 3, kzTxt,           text_color=color.white)
+    table.cell(hud, 0, 4, "VAH / POC / VAL", text_color=color.white)
+    table.cell(hud, 1, 4, vaLocked ?
+         str.tostring(vah, format.mintick) + " / " +
+         str.tostring(poc, format.mintick) + " / " +
+         str.tostring(val, format.mintick) : "—", text_color=color.white)
+    table.cell(hud, 0, 5, "Signals L/S",   text_color=color.white)
+    table.cell(hud, 1, 5, str.tostring(cntLong) + " / " + str.tostring(cntShort), text_color=color.white)
+    table.cell(hud, 0, 6, "RR target",     text_color=color.white)
+    table.cell(hud, 1, 6, "1 : " + str.tostring(rrTarget, "#.#"), text_color=color.white)
+
+// ============================== ALERTS ======================================
+alertcondition(longSig,  "LONG signal",  "SMC+VP LONG {{ticker}} @ {{close}}")
+alertcondition(shortSig, "SHORT signal", "SMC+VP SHORT {{ticker}} @ {{close}}")
+alertcondition(newBOS,   "BOS",          "BOS on {{ticker}}")
+alertcondition(newCHOCH, "CHoCH",        "CHoCH on {{ticker}}")
+
+if alertLong and longSig
+    alert("LONG " + syminfo.ticker + " @ " + str.tostring(close, format.mintick) +
+          " | SL " + str.tostring(slLong,  format.mintick) +
+          " | TP " + str.tostring(tpLong,  format.mintick), alert.freq_once_per_bar_close)
+if alertShort and shortSig
+    alert("SHORT " + syminfo.ticker + " @ " + str.tostring(close, format.mintick) +
+          " | SL " + str.tostring(slShort, format.mintick) +
+          " | TP " + str.tostring(tpShort, format.mintick), alert.freq_once_per_bar_close)
